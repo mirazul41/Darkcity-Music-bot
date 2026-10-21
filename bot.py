@@ -267,3 +267,19 @@ async def leave(interaction: discord.Interaction):
 
 
 bot.run(TOKEN)
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Dark City Music Bot is running!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+Thread(target=run_web, daemon=True).start()
+
+bot.run(TOKEN)
