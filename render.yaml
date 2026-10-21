@@ -1,0 +1,8 @@
+services:
+  - type: worker
+    name: dark-city-music-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    # Render worker pricing/availability may vary; add DISCORD_BOT_TOKEN
+    # under Dashboard > Environment. Never commit your real token.
