@@ -1,117 +1,95 @@
 
-@bot.tree.command(
-    name="resume",
-    description="Resume the paused song"
+import os
+import asyncio
+import logging
+from collections import deque
+from typing import Optional
+from threading import Thread
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+import yt_dlp
+from dotenv import load_dotenv
+from flask import Flask
+
+# Load environment variables
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError(
+        "DISCORD_BOT_TOKEN missing. Add it to your .env file "
+        "or hosting environment variables."
+    )
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-@app_commands.guild_only()
-async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
 
-    if vc and vc.is_paused():
-        vc.resume()
-        await interaction.response.send_message(
-            "▶️ গান আবার চালু হয়েছে।"
-        )
-    else:
-        await interaction.response.send_message(
-            "কোনো গান pause করা নেই।",
-            ephemeral=True
-        )
+# Flask web server for Render Web Service
+app = Flask(__name__)
 
 
-@bot.tree.command(
-    name="skip",
-    description="Skip the current song"
-)
-@app_commands.guild_only()
-async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-
-    if vc and (vc.is_playing() or vc.is_paused()):
-        await interaction.response.send_message(
-            "⏭️ গান skip করা হয়েছে।"
-        )
-        vc.stop()
-    else:
-        await interaction.response.send_message(
-            "এখন কোনো গান চলছে না।",
-            ephemeral=True
-        )
+@app.route("/")
+def home():
+    return "Dark City Music Bot is running!", 200
 
 
-@bot.tree.command(
-    name="stop",
-    description="Stop music and clear the queue"
-)
-@app_commands.guild_only()
-async def stop(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+@app.route("/health")
+def health():
+    return {"status": "online"}, 200
 
-    get_queue(interaction.guild_id).clear()
 
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
-
-    now_playing.pop(interaction.guild_id, None)
-
-    await interaction.response.send_message(
-        "⏹️ গান বন্ধ এবং Queue পরিষ্কার করা হয়েছে।"
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        use_reloader=False
     )
 
 
-@bot.tree.command(
-    name="queue",
-    description="Show queued songs"
+# Start web server before starting Discord bot
+web_thread = Thread(target=run_web, daemon=True)
+web_thread.start()
+
+# Discord bot setup
+intents = discord.Intents.default()
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
 )
-@app_commands.guild_only()
-async def queue(interaction: discord.Interaction):
-    tracks = list(get_queue(interaction.guild_id))
-    current = now_playing.get(interaction.guild_id)
 
-    lines = []
+# Music queues, one per server
+queues: dict[int, deque] = {}
+now_playing: dict[int, str] = {}
 
-    if current:
-        lines.append(f"🎶 **Now playing:** {current}")
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    # Prefer YouTube for search, then fall back to SoundCloud if YouTube
+    # blocks the Render server. Direct supported audio URLs still work.
+    "source_address": "0.0.0.0",
+}
 
-    lines.extend(
-        f"{i}. {track['title']}"
-        for i, track in enumerate(tracks[:10], start=1)
-    )
-
-    if not lines:
-        lines = ["Queue খালি।"]
-
-    await interaction.response.send_message(
-        "\n".join(lines)
-    )
-
-
-@bot.tree.command(
-    name="leave",
-    description="Leave the voice channel and clear queue"
-)
-@app_commands.guild_only()
-async def leave(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-
-    get_queue(interaction.guild_id).clear()
-    now_playing.pop(interaction.guild_id, None)
-
-    if vc:
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-
-        await vc.disconnect(force=True)
-
-        await interaction.response.send_message(
-            "👋 Voice Channel থেকে বের হয়েছি।"
-        )
-    else:
-        await interaction.response.send_message(
-            "আমি কোনো Voice Channel-এ নেই।",
-            ephemeral=True
-        )
+FFMPEG_OPTIONS = {
+    "before_options": (
+        "-reconnect 1 "
+        "-reconnect_streamed 1 "
+        "-reconnect_delay_max 5"
+    ),
+    "options": "-vn",
+}
 
 
-# Start Discord bot exactly once, at the end
-bot.run(TOKEN)
+def get_queue(guild_id: int) -> deque:
+    if guild_id not in queues:
+        queues[guild_id] = deque()
+    return queues[guild_id]
+
