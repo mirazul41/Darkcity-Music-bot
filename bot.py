@@ -231,13 +231,84 @@ async def on_ready():
     name="join",
     description="Join your voice channel",
 )
+
+async def ensure_voice(
+    interaction: discord.Interaction,
+) -> discord.VoiceClient | None:
+    if not interaction.guild:
+        await interaction.followup.send(
+            "❌ এই কমান্ড সার্ভারের ভেতরে ব্যবহার করো।",
+            ephemeral=True,
+        )
+        return None
+
+    member = interaction.user
+
+    if (
+        not isinstance(member, discord.Member)
+        or member.voice is None
+        or member.voice.channel is None
+    ):
+        await interaction.followup.send(
+            "❌ আগে Discord-এর একটি voice channel-এ ঢোকো।",
+            ephemeral=True,
+        )
+        return None
+
+    channel = member.voice.channel
+    voice = interaction.guild.voice_client
+
+    try:
+        if voice is None:
+            voice = await asyncio.wait_for(
+                channel.connect(timeout=20, reconnect=True),
+                timeout=25,
+            )
+        elif not voice.is_connected():
+            voice = await asyncio.wait_for(
+                channel.connect(timeout=20, reconnect=True),
+                timeout=25,
+            )
+        elif voice.channel != channel:
+            await asyncio.wait_for(
+                voice.move_to(channel),
+                timeout=20,
+            )
+
+        return voice
+
+    except Exception as exc:
+        log.exception("Voice connection failed")
+        await interaction.followup.send(
+            f"❌ Voice channel-এ ঢোকা যায়নি: "
+            f"`{type(exc).__name__}: {exc}`",
+            ephemeral=True,
+        )
+        return None
+
+
+@bot.tree.command(
+    name="join",
+    description="Join your voice channel",
+)
 async def join(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    voice = await ensure_voice(interaction)
 
-    if voice:
+    try:
+        voice = await ensure_voice(interaction)
+
+        if voice and voice.is_connected():
+            await interaction.followup.send(
+                f"✅ **{voice.channel}**-এ ঢুকেছি!",
+                ephemeral=True,
+            )
+
+    except Exception as exc:
+        log.exception("Join command failed")
+
         await interaction.followup.send(
-            f"✅ Joined **{voice.channel}**"
+            f"❌ Join failed: `{type(exc).__name__}: {exc}`",
+            ephemeral=True,
         )
 
 
