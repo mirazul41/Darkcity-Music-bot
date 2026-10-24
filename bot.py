@@ -93,36 +93,3 @@ def get_queue(guild_id: int) -> deque:
         queues[guild_id] = deque()
     return queues[guild_id]
 
-
-async def search_track(query: str) -> Optional[dict]:
-    """
-    Find a track with yt-dlp.
-    For song-name searches, try YouTube first and fall back to SoundCloud
-    if YouTube refuses the request. This does not bypass login/access controls.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _search_one(source_query: str):
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(source_query, download=False)
-
-            if not info:
-                return None
-
-            if "entries" in info:
-                info = next(
-                    (entry for entry in info["entries"] if entry),
-                    None
-                )
-
-            if not info:
-                return None
-
-            return {
-                "title": info.get("title", "Unknown title"),
-                "url": info.get("url"),
-                "webpage_url": info.get("webpage_url", source_query),
-                "duration": info.get("duration"),
-            }
-
-    def _search():
