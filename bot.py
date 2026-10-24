@@ -4,14 +4,14 @@ import asyncio
 import logging
 from collections import deque
 from threading import Thread
-from typing import Any
+from typing import Any, Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-import yt_dlp
 from dotenv import load_dotenv
 from flask import Flask
+import yt_dlp
 
 load_dotenv()
 
@@ -27,7 +27,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("darkcity-music")
 
-# Render health-check web server
+# --------------------------------------------------
+# Render web server
+# --------------------------------------------------
+
 app = Flask(__name__)
 
 
@@ -48,6 +51,10 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+# --------------------------------------------------
+# Discord bot setup
+# --------------------------------------------------
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -59,7 +66,8 @@ YDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "socket_timeout": 15,
+    "socket_timeout": 20,
+    "extractor_retries": 1,
 }
 
 FFMPEG_OPTIONS = {
@@ -77,7 +85,11 @@ def get_queue(guild_id: int) -> deque[dict[str, Any]]:
     return queues[guild_id]
 
 
-def _extract_track(query: str) -> dict[str, Any] | None:
+# --------------------------------------------------
+# Search song
+# --------------------------------------------------
+
+def _extract_track(query: str) -> Optional[dict[str, Any]]:
     query = query.strip()
     if not query:
         return None
@@ -92,6 +104,8 @@ def _extract_track(query: str) -> dict[str, Any] | None:
 
     for candidate in candidates:
         try:
+            log.info("Searching audio source: %s", candidate)
+
             with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
                 data = ydl.extract_info(candidate, download=False)
 
@@ -116,125 +130,24 @@ def _extract_track(query: str) -> dict[str, Any] | None:
                     "webpage_url": data.get("webpage_url") or query,
                 }
 
-        except Exception as exc:
-            log.warning(
-                "Audio lookup failed for %s: %s",
-                candidate,
-                exc,
-            )
+        except Exception:
+            log.exception("Audio lookup failed for %s", candidate)
 
     return None
 
 
-async def search_track(query: str) -> dict[str, Any] | None:
+async def search_track(query: str) -> Optional[dict[str, Any]]:
     return await asyncio.to_thread(_extract_track, query)
 
 
-async def play_next(
-    guild: discord.Guild,
-    text_channel: discord.abc.Messageable,
-):
-    voice = guild.voice_client
-
-    if not voice or voice.is_playing() or voice.is_paused():
-        return
-
-    queue = get_queue(guild.id)
-
-    if not queue:
-        now_playing.pop(guild.id, None)
-        return
-
-    track = queue.popleft()
-    now_playing[guild.id] = track["title"]
-
-    try:
-        source = discord.FFmpegPCMAudio(
-            track["url"],
-            **FFMPEG_OPTIONS,
-        )
-
-        def after_play(error: Exception | None):
-            if error:
-                log.error("Player error: %s", error)
-
-            future = asyncio.run_coroutine_threadsafe(
-                play_next(guild, text_channel),
-                bot.loop,
-            )
-
-            try:
-                future.result()
-            except Exception:
-                log.exception("Failed to start next queued track")
-
-        voice.play(source, after=after_play)
-
-        await text_channel.send(
-            f"🎶 **Now playing:** "
-            f"[{track['title']}]({track['webpage_url']})"
-        )
-
-    except Exception as exc:
-        log.exception("Could not play track")
-        await text_channel.send(
-            f"❌ গান চালানো যায়নি: `{exc}`"
-        )
-        await play_next(guild, text_channel)
-
+# --------------------------------------------------
+# Voice connection
+# --------------------------------------------------
 
 async def ensure_voice(
     interaction: discord.Interaction,
-) -> discord.VoiceClient | None:
-    if not interaction.guild:
-        await interaction.followup.send(
-            "এই কমান্ড সার্ভারের ভেতরে ব্যবহার করো।",
-            ephemeral=True,
-        )
-        return None
+) -> Optional[discord.VoiceClient]:
 
-    member = interaction.user
-
-    if (
-        not isinstance(member, discord.Member)
-        or not member.voice
-        or not member.voice.channel
-    ):
-        await interaction.followup.send(
-            "আগে একটি voice channel-এ join করো।",
-            ephemeral=True,
-        )
-        return None
-
-    voice = interaction.guild.voice_client
-
-    if voice is None:
-        voice = await member.voice.channel.connect()
-    elif voice.channel != member.voice.channel:
-        await voice.move_to(member.voice.channel)
-
-    return voice
-
-
-@bot.event
-async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        log.info("Synced %d slash commands", len(synced))
-    except Exception:
-        log.exception("Could not sync slash commands")
-
-    log.info("Bot online as %s", bot.user)
-
-
-@bot.tree.command(
-    name="join",
-    description="Join your voice channel",
-)
-
-async def ensure_voice(
-    interaction: discord.Interaction,
-) -> discord.VoiceClient | None:
     if not interaction.guild:
         await interaction.followup.send(
             "❌ এই কমান্ড সার্ভারের ভেতরে ব্যবহার করো।",
@@ -260,32 +173,134 @@ async def ensure_voice(
 
     try:
         if voice is None:
+            log.info("Connecting to voice channel: %s", channel.name)
             voice = await asyncio.wait_for(
                 channel.connect(timeout=20, reconnect=True),
                 timeout=25,
             )
+
         elif not voice.is_connected():
+            log.info("Reconnecting to voice channel: %s", channel.name)
             voice = await asyncio.wait_for(
                 channel.connect(timeout=20, reconnect=True),
                 timeout=25,
             )
+
         elif voice.channel != channel:
+            log.info("Moving to voice channel: %s", channel.name)
             await asyncio.wait_for(
                 voice.move_to(channel),
                 timeout=20,
             )
 
+        log.info("Voice connected: %s", voice.channel)
         return voice
 
     except Exception as exc:
         log.exception("Voice connection failed")
+
         await interaction.followup.send(
-            f"❌ Voice channel-এ ঢোকা যায়নি: "
+            f"❌ Voice connection failed: "
             f"`{type(exc).__name__}: {exc}`",
             ephemeral=True,
         )
         return None
 
+
+# --------------------------------------------------
+# Play next queued song
+# --------------------------------------------------
+
+async def play_next(
+    guild: discord.Guild,
+    text_channel: discord.abc.Messageable,
+):
+    voice = guild.voice_client
+
+    if not voice or not voice.is_connected():
+        log.warning("Cannot play: voice client is disconnected")
+        return
+
+    if voice.is_playing() or voice.is_paused():
+        return
+
+    queue = get_queue(guild.id)
+
+    if not queue:
+        now_playing.pop(guild.id, None)
+        log.info("Queue empty in guild %s", guild.id)
+        return
+
+    track = queue.popleft()
+    now_playing[guild.id] = track["title"]
+
+    try:
+        source = discord.FFmpegPCMAudio(
+            track["url"],
+            **FFMPEG_OPTIONS,
+        )
+
+        def after_play(error: Optional[Exception]):
+            if error:
+                log.error("Audio player error: %s", error)
+
+            if bot.loop.is_closed():
+                return
+
+            future = asyncio.run_coroutine_threadsafe(
+                play_next(guild, text_channel),
+                bot.loop,
+            )
+
+            def report_result(done_future):
+                try:
+                    done_future.result()
+                except Exception:
+                    log.exception("Failed to play next queued track")
+
+            future.add_done_callback(report_result)
+
+        voice.play(source, after=after_play)
+
+        await text_channel.send(
+            f"🎶 **Now playing:** "
+            f"[{track['title']}]({track['webpage_url']})"
+        )
+
+        log.info("Started playback: %s", track["title"])
+
+    except Exception as exc:
+        log.exception("Could not play track")
+
+        try:
+            await text_channel.send(
+                f"❌ গান চালানো যায়নি: "
+                f"`{type(exc).__name__}: {exc}`"
+            )
+        except Exception:
+            log.exception("Could not send playback error message")
+
+        await play_next(guild, text_channel)
+
+
+# --------------------------------------------------
+# Ready event
+# --------------------------------------------------
+
+@bot.event
+async def on_ready():
+    log.info("Discord connected as %s", bot.user)
+
+    try:
+        synced = await bot.tree.sync()
+        log.info("Synced %d slash commands", len(synced))
+    except Exception:
+        log.exception("Could not sync slash commands")
+
+
+# --------------------------------------------------
+# /join
+# --------------------------------------------------
 
 @bot.tree.command(
     name="join",
@@ -312,53 +327,82 @@ async def join(interaction: discord.Interaction):
         )
 
 
+# --------------------------------------------------
+# /play
+# --------------------------------------------------
+
 @bot.tree.command(
     name="play",
     description="Play a song by name or URL",
 )
 @app_commands.describe(query="Song name or supported URL")
-async def play(interaction: discord.Interaction, query: str):
+async def play(
+    interaction: discord.Interaction,
+    query: str,
+):
     await interaction.response.defer(thinking=True)
 
     if not interaction.guild or not interaction.channel:
         await interaction.followup.send(
-            "এই কমান্ড সার্ভারের ভেতরে ব্যবহার করো।"
+            "❌ এই কমান্ড সার্ভারের ভেতরে ব্যবহার করো।"
         )
         return
 
-    voice = await ensure_voice(interaction)
-    if not voice:
-        return
+    try:
+        voice = await ensure_voice(interaction)
+        if not voice:
+            return
 
-    await interaction.followup.send("🔎 গান খুঁজছি...")
-
-    track = await search_track(query)
-
-    if not track:
         await interaction.followup.send(
-            "❌ গানটি পাওয়া যায়নি অথবা সোর্সটি Render থেকে "
-            "access করা যাচ্ছে না। অন্য নাম বা URL দিয়ে চেষ্টা করো।"
+            "🔎 গান খুঁজছি..."
         )
-        return
 
-    queue = get_queue(interaction.guild.id)
-    queue.append(track)
+        track = await search_track(query)
 
-    if voice.is_playing() or voice.is_paused():
+        if not track:
+            await interaction.followup.send(
+                "❌ গানটি পাওয়া যায়নি। YouTube verification, "
+                "source access অথবা অন্য কোনো extraction error হতে পারে। "
+                "Render Logs পরীক্ষা করো।"
+            )
+            return
+
+        queue = get_queue(interaction.guild.id)
+        queue.append(track)
+
+        if voice.is_playing() or voice.is_paused():
+            await interaction.followup.send(
+                f"➕ Queue-তে যোগ হয়েছে: **{track['title']}** "
+                f"(position {len(queue)})"
+            )
+        else:
+            await play_next(
+                interaction.guild,
+                interaction.channel,
+            )
+
+    except Exception as exc:
+        log.exception("Play command failed")
+
         await interaction.followup.send(
-            f"➕ Queue-তে যোগ হয়েছে: **{track['title']}** "
-            f"(position {len(queue)})"
+            f"❌ Play error: `{type(exc).__name__}: {exc}`"
         )
-    else:
-        await play_next(interaction.guild, interaction.channel)
 
+
+# --------------------------------------------------
+# /pause
+# --------------------------------------------------
 
 @bot.tree.command(
     name="pause",
     description="Pause the current song",
 )
 async def pause(interaction: discord.Interaction):
-    voice = interaction.guild.voice_client if interaction.guild else None
+    voice = (
+        interaction.guild.voice_client
+        if interaction.guild
+        else None
+    )
 
     if voice and voice.is_playing():
         voice.pause()
@@ -372,12 +416,20 @@ async def pause(interaction: discord.Interaction):
         )
 
 
+# --------------------------------------------------
+# /resume
+# --------------------------------------------------
+
 @bot.tree.command(
     name="resume",
     description="Resume the paused song",
 )
 async def resume(interaction: discord.Interaction):
-    voice = interaction.guild.voice_client if interaction.guild else None
+    voice = (
+        interaction.guild.voice_client
+        if interaction.guild
+        else None
+    )
 
     if voice and voice.is_paused():
         voice.resume()
@@ -391,12 +443,20 @@ async def resume(interaction: discord.Interaction):
         )
 
 
+# --------------------------------------------------
+# /skip
+# --------------------------------------------------
+
 @bot.tree.command(
     name="skip",
     description="Skip the current song",
 )
 async def skip(interaction: discord.Interaction):
-    voice = interaction.guild.voice_client if interaction.guild else None
+    voice = (
+        interaction.guild.voice_client
+        if interaction.guild
+        else None
+    )
 
     if voice and (voice.is_playing() or voice.is_paused()):
         voice.stop()
@@ -409,6 +469,10 @@ async def skip(interaction: discord.Interaction):
             ephemeral=True,
         )
 
+
+# --------------------------------------------------
+# /stop
+# --------------------------------------------------
 
 @bot.tree.command(
     name="stop",
@@ -428,6 +492,10 @@ async def stop(interaction: discord.Interaction):
         "⏹️ গান বন্ধ এবং queue clear করা হয়েছে।"
     )
 
+
+# --------------------------------------------------
+# /queue
+# --------------------------------------------------
 
 @bot.tree.command(
     name="queue",
@@ -463,6 +531,10 @@ async def queue_command(interaction: discord.Interaction):
     )
 
 
+# --------------------------------------------------
+# /leave
+# --------------------------------------------------
+
 @bot.tree.command(
     name="leave",
     description="Leave voice channel and clear queue",
@@ -481,5 +553,10 @@ async def leave(interaction: discord.Interaction):
     )
 
 
+# --------------------------------------------------
+# Start bot
+# --------------------------------------------------
+
 if __name__ == "__main__":
+    log.info("Starting Dark City Music Bot...")
     bot.run(TOKEN)
